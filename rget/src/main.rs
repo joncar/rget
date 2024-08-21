@@ -1,6 +1,9 @@
 use std::env;
 use std::fs::File;
+#[cfg(not(windows))]
 use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
 use futures::StreamExt;
 use std::time::{Instant, Duration};
 use http::StatusCode;
@@ -102,7 +105,15 @@ fn fetch_writes(filename: String, content_length: u64, rx: Receiver<WritePacket>
     //println!("WRITES BEGIN");
     while let Ok(packet) = rx.recv() {
         let length = packet.buffer.len();
-        f.write_all_at(&mut packet.buffer.as_ref(), packet.offset)?;
+        #[cfg(windows)] {
+            let written = f.seek_write(&mut packet.buffer.as_ref(), packet.offset)?;
+            if written != length {
+                panic!("TODO: Short write");
+            }
+        }
+        #[cfg(not(windows))] {
+            f.write_all_at(&mut packet.buffer.as_ref(), packet.offset)?;
+        }
         write_stats.add(length as u64);
     }
     //println!("WRITES END");
