@@ -1,6 +1,6 @@
 use std::env;
-use tokio::fs::File;
-use tokio::io::AsyncSeekExt;
+use std::fs::File;
+use std::os::unix::fs::FileExt;
 use futures::StreamExt;
 use std::time::{Instant, Duration};
 use http::StatusCode;
@@ -64,13 +64,18 @@ impl Statistics {
     fn add(&mut self, bytes: u64) {
         self.completed_bytes += bytes;
         if self.last_print_time.elapsed().as_secs() >= 1 && self.completed_bytes >= self.next_print_bytes {
-            let percent = self.completed_bytes as f64 / self.total_bytes as f64 * 100.0;
-            let mbps = as_megabits_per_sec(self.completed_bytes - self.last_print_bytes, self.last_print_time.elapsed());
-            println!("{0}: {1} {2:.1}% {3:.1}Mbps", self.label, Size::from_bytes(self.completed_bytes), percent, mbps);
+            let percent = self.print();
             self.last_print_time = Instant::now();
             self.last_print_bytes = self.completed_bytes;
             self.next_print_bytes = ((percent.floor() + 1.0) / 100.0 * self.total_bytes as f64) as u64;
         }
+    }
+
+    fn print(&self) -> f64 {
+        let percent = self.completed_bytes as f64 / self.total_bytes as f64 * 100.0;
+        let mbps = as_megabits_per_sec(self.completed_bytes - self.last_print_bytes, self.last_print_time.elapsed());
+        println!("{0}: {1} {2:.1}% {3:.1}Mbps", self.label, Size::from_bytes(self.completed_bytes), percent, mbps);
+        percent
     }
 }
 
@@ -89,19 +94,19 @@ async fn get_content_length(url: &str) -> Result<u64, Box<dyn std::error::Error>
     Ok(content_length)
 }
 
-async fn fetch_writes(filename: String, content_length: u64, rx: Receiver<WritePacket>) -> Result<(), std::io::Error> {
-    let mut f = File::create(filename).await?;
+fn fetch_writes(filename: String, content_length: u64, rx: Receiver<WritePacket>) -> Result<(), std::io::Error> {
+    let f = File::create(filename)?;
 
     let mut write_stats = Statistics::new(StatisticsLabel::Disk, content_length);
 
-    println!("WRITES BEGIN");
+    //println!("WRITES BEGIN");
     while let Ok(packet) = rx.recv() {
         let length = packet.buffer.len();
-        f.seek(std::io::SeekFrom::Start(packet.offset)).await?;
-        tokio::io::copy(&mut packet.buffer.as_ref(), &mut f).await?;
+        f.write_all_at(&mut packet.buffer.as_ref(), packet.offset)?;
         write_stats.add(length as u64);
     }
-    println!("WRITES END");
+    //println!("WRITES END");
+    write_stats.print();
 
     Ok(())
 }
@@ -151,7 +156,8 @@ async fn fetch(url: &str, filename: &str) -> Result<(), Box<dyn std::error::Erro
 
     let (tx, rx) = channel();
 
-    let fw = tokio::spawn(fetch_writes(String::from(filename), content_length, rx));
+    let fw_filename = String::from(filename);
+    let fw = tokio::task::spawn_blocking(move || { fetch_writes(fw_filename, content_length, rx) });
 
     let max_request_length = 1024 * 1024;
     let max_requests = 8;
@@ -180,6 +186,8 @@ async fn fetch(url: &str, filename: &str) -> Result<(), Box<dyn std::error::Erro
     //println!("QUEUE END");
 
     while let Some(_) = set.join_next().await { }
+
+    net_stats.lock().unwrap().print();
 
     //println!("REQUESTS END");
 
