@@ -2,15 +2,58 @@ use std::env;
 use tokio::fs::File;
 use tokio::io::AsyncSeekExt;
 use futures::StreamExt;
-use std::time::Instant;
+use std::time::{Instant, Duration};
 use http::StatusCode;
 use bytes::Bytes;
 use std::sync::mpsc::{Sender, Receiver, channel};
+use std::sync::{Arc, Mutex};
 use tokio::task::JoinSet;
+
+fn as_megabits_per_sec(bytes: u64, elapsed: Duration) -> f64 {
+    let bytes_per_sec = (bytes as f64) / elapsed.as_secs_f64();
+    let megabytes_per_sec = bytes_per_sec / (1024.0*1024.0);
+    let megabits_per_sec = megabytes_per_sec * 8.0;
+    megabits_per_sec
+}
 
 struct WritePacket {
     offset: u64,
     buffer: Bytes
+}
+
+struct Statistics {
+    start_time: Instant,
+    last_print_time: Instant,
+    last_print_bytes: u64,
+    next_print_bytes: u64,
+    completed_bytes: u64,
+    total_bytes: u64
+}
+
+impl Statistics {
+    fn new(total_bytes: u64) -> Statistics {
+        let now = Instant::now();
+        Statistics {
+            start_time: now,
+            last_print_time: now,
+            last_print_bytes: 0,
+            next_print_bytes: 0,
+            completed_bytes: 0,
+            total_bytes
+        }
+    }
+
+    fn add(&mut self, bytes: u64) {
+        self.completed_bytes += bytes;
+        if self.last_print_time.elapsed().as_secs() >= 2 || self.completed_bytes >= self.next_print_bytes {
+            let percent = self.completed_bytes as f64 / self.total_bytes as f64 * 100.0;
+            let mbps = as_megabits_per_sec(self.completed_bytes - self.last_print_bytes, self.last_print_time.elapsed());
+            println!("{0} bytes downloaded: {1:.1}% {2:.1}Mbps", self.completed_bytes, percent, mbps);
+            self.last_print_time = Instant::now();
+            self.last_print_bytes = self.completed_bytes;
+            self.next_print_bytes = ((percent.floor() + 1.0) / 100.0 * self.total_bytes as f64) as u64;
+        }
+    }
 }
 
 async fn get_content_length(url: &str) -> Result<u64, Box<dyn std::error::Error>> {
@@ -31,15 +74,17 @@ async fn get_content_length(url: &str) -> Result<u64, Box<dyn std::error::Error>
 async fn fetch_writes(filename: String, rx: Receiver<WritePacket>) -> Result<(), std::io::Error> {
     let mut f = File::create(filename).await?;
 
+    println!("WRITES BEGIN");
     while let Ok(packet) = rx.recv() {
         f.seek(std::io::SeekFrom::Start(packet.offset)).await?;
         tokio::io::copy(&mut packet.buffer.as_ref(), &mut f).await?;
     }
+    println!("WRITES END");
 
     Ok(())
 }
 
-async fn fetch_read(url: String, tx: Sender<WritePacket>, start_offset: u64, end_offset: u64) -> Result<(), reqwest::Error> {
+async fn fetch_read(net_stats: Arc<Mutex<Statistics>>, url: String, tx: Sender<WritePacket>, start_offset: u64, end_offset: u64) -> Result<(), reqwest::Error> {
     let last_offset = end_offset - 1;
 
     let client = reqwest::Client::new();
@@ -55,7 +100,9 @@ async fn fetch_read(url: String, tx: Sender<WritePacket>, start_offset: u64, end
 
     let mut stream = response.bytes_stream();
     let mut offset = start_offset;
+    let mut count_streams = 0;
 
+    //println!("REQUEST BEGIN {start_offset}");
     while let Some(item) = stream.next().await {
         let buffer: Bytes = item.unwrap();
         let length = buffer.len() as u64;
@@ -63,8 +110,12 @@ async fn fetch_read(url: String, tx: Sender<WritePacket>, start_offset: u64, end
         let packet = WritePacket { buffer, offset };
         tx.send(packet).unwrap();
 
+        net_stats.lock().unwrap().add(length);
+
         offset += length;
+        count_streams += 1;
     }
+    //println!("REQUEST END {start_offset} count_streams={count_streams}");
 
     Ok(())
 }
@@ -73,6 +124,8 @@ async fn fetch(url: &str, filename: &str) -> Result<(), Box<dyn std::error::Erro
     let start_time = Instant::now();
 
     let content_length = get_content_length(url).await?;
+
+    let net_stats = Arc::new(Mutex::new(Statistics::new(content_length)));
 
     let (tx, rx) = channel();
 
@@ -92,7 +145,7 @@ async fn fetch(url: &str, filename: &str) -> Result<(), Box<dyn std::error::Erro
 
         let end_offset = std::cmp::min(offset + max_request_length, content_length);
 
-        set.spawn(fetch_read(String::from(url), tx.clone(), offset, end_offset));
+        set.spawn(fetch_read(net_stats.clone(), String::from(url), tx.clone(), offset, end_offset));
 
         offset = end_offset;
 
@@ -102,17 +155,18 @@ async fn fetch(url: &str, filename: &str) -> Result<(), Box<dyn std::error::Erro
     }
 
     drop(tx);
+    //println!("QUEUE END");
 
     while let Some(_) = set.join_next().await { }
+
+    //println!("REQUESTS END");
 
     fw.await.unwrap().unwrap();
 
     let elapsed = start_time.elapsed();
     println!("Duration: {elapsed:?}");
 
-    let bytes_per_sec = (content_length as f64) / elapsed.as_secs_f64();
-    let megabytes_per_sec = bytes_per_sec / (1024.0*1024.0);
-    let megabits_per_sec = megabytes_per_sec * 8.0;
+    let megabits_per_sec = as_megabits_per_sec(content_length, elapsed);
     println!("Rate: {megabits_per_sec} Mbps");
     
     Ok(())
