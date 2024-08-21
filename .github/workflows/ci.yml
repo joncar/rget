@@ -10,12 +10,16 @@ env:
 jobs:
   build_and_test:
     name: Rust project - latest
-    runs-on: ubuntu-latest
     strategy:
       matrix:
         os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: ./rget
     steps:
       - uses: actions/checkout@v4
-      - run: rustup update stable && rustup default stable
+      - run: rustup update stable
+      - run: rustup default stable
       - run: cargo build --release --verbose
       - run: cargo test --release --verbose
