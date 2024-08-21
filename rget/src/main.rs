@@ -8,6 +8,8 @@ use bytes::Bytes;
 use std::sync::mpsc::{Sender, Receiver, channel};
 use std::sync::{Arc, Mutex};
 use tokio::task::JoinSet;
+use size::Size;
+use std::fmt;
 
 fn as_megabits_per_sec(bytes: u64, elapsed: Duration) -> f64 {
     let bytes_per_sec = (bytes as f64) / elapsed.as_secs_f64();
@@ -21,7 +23,22 @@ struct WritePacket {
     buffer: Bytes
 }
 
+enum StatisticsLabel {
+    Network,
+    Disk
+}
+
+impl fmt::Display for StatisticsLabel {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            StatisticsLabel::Network => write!(f, "Network"),
+            StatisticsLabel::Disk => write!(f, "Disk")
+        }
+    }
+}
+
 struct Statistics {
+    label: StatisticsLabel,
     start_time: Instant,
     last_print_time: Instant,
     last_print_bytes: u64,
@@ -31,9 +48,10 @@ struct Statistics {
 }
 
 impl Statistics {
-    fn new(total_bytes: u64) -> Statistics {
+    fn new(label: StatisticsLabel, total_bytes: u64) -> Statistics {
         let now = Instant::now();
         Statistics {
+            label,
             start_time: now,
             last_print_time: now,
             last_print_bytes: 0,
@@ -45,10 +63,10 @@ impl Statistics {
 
     fn add(&mut self, bytes: u64) {
         self.completed_bytes += bytes;
-        if self.last_print_time.elapsed().as_secs() >= 2 || self.completed_bytes >= self.next_print_bytes {
+        if self.last_print_time.elapsed().as_secs() >= 1 && self.completed_bytes >= self.next_print_bytes {
             let percent = self.completed_bytes as f64 / self.total_bytes as f64 * 100.0;
             let mbps = as_megabits_per_sec(self.completed_bytes - self.last_print_bytes, self.last_print_time.elapsed());
-            println!("{0} bytes downloaded: {1:.1}% {2:.1}Mbps", self.completed_bytes, percent, mbps);
+            println!("{0}: {1} {2:.1}% {3:.1}Mbps", self.label, Size::from_bytes(self.completed_bytes), percent, mbps);
             self.last_print_time = Instant::now();
             self.last_print_bytes = self.completed_bytes;
             self.next_print_bytes = ((percent.floor() + 1.0) / 100.0 * self.total_bytes as f64) as u64;
@@ -71,13 +89,17 @@ async fn get_content_length(url: &str) -> Result<u64, Box<dyn std::error::Error>
     Ok(content_length)
 }
 
-async fn fetch_writes(filename: String, rx: Receiver<WritePacket>) -> Result<(), std::io::Error> {
+async fn fetch_writes(filename: String, content_length: u64, rx: Receiver<WritePacket>) -> Result<(), std::io::Error> {
     let mut f = File::create(filename).await?;
+
+    let mut write_stats = Statistics::new(StatisticsLabel::Disk, content_length);
 
     println!("WRITES BEGIN");
     while let Ok(packet) = rx.recv() {
+        let length = packet.buffer.len();
         f.seek(std::io::SeekFrom::Start(packet.offset)).await?;
         tokio::io::copy(&mut packet.buffer.as_ref(), &mut f).await?;
+        write_stats.add(length as u64);
     }
     println!("WRITES END");
 
@@ -125,11 +147,11 @@ async fn fetch(url: &str, filename: &str) -> Result<(), Box<dyn std::error::Erro
 
     let content_length = get_content_length(url).await?;
 
-    let net_stats = Arc::new(Mutex::new(Statistics::new(content_length)));
+    let net_stats = Arc::new(Mutex::new(Statistics::new(StatisticsLabel::Network, content_length)));
 
     let (tx, rx) = channel();
 
-    let fw = tokio::spawn(fetch_writes(String::from(filename), rx));
+    let fw = tokio::spawn(fetch_writes(String::from(filename), content_length, rx));
 
     let max_request_length = 1024 * 1024;
     let max_requests = 8;
