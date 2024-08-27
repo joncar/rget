@@ -13,6 +13,8 @@ use std::sync::{Arc, Mutex};
 use tokio::task::JoinSet;
 use size::Size;
 use std::fmt;
+use std::ops::Sub;
+use std::collections::HashMap;
 
 fn as_megabits_per_sec(bytes: u64, elapsed: Duration) -> f64 {
     let bytes_per_sec = (bytes as f64) / elapsed.as_secs_f64();
@@ -26,6 +28,7 @@ struct WritePacket {
     buffer: Bytes
 }
 
+#[derive(Copy, Clone)]
 enum StatisticsLabel {
     Network,
     Disk
@@ -40,6 +43,21 @@ impl fmt::Display for StatisticsLabel {
     }
 }
 
+struct StatisticsDiff {
+    label: StatisticsLabel,
+    duration: Duration,
+    completed_bytes: u64
+}
+
+struct StatisticsSnapshot {
+    label: StatisticsLabel,
+    start_time: Instant,
+    end_time: Instant,
+    completed_bytes: u64,
+    concurrency: usize
+}
+
+#[derive(Clone)]
 struct Statistics {
     label: StatisticsLabel,
     start_time: Instant,
@@ -47,7 +65,8 @@ struct Statistics {
     last_print_bytes: u64,
     next_print_bytes: u64,
     completed_bytes: u64,
-    total_bytes: u64
+    total_bytes: u64,
+    concurrency: usize
 }
 
 impl Statistics {
@@ -60,7 +79,8 @@ impl Statistics {
             last_print_bytes: 0,
             next_print_bytes: 0,
             completed_bytes: 0,
-            total_bytes
+            total_bytes,
+            concurrency: 1
         }
     }
 
@@ -74,11 +94,68 @@ impl Statistics {
         }
     }
 
+    fn set_concurrency(&mut self, new_concurrency: usize) {
+        self.concurrency = new_concurrency;
+    }
+
+    fn snapshot(&self) -> StatisticsSnapshot {
+        StatisticsSnapshot {
+            label: self.label,
+            start_time: self.start_time,
+            end_time: Instant::now(),
+            completed_bytes: self.completed_bytes,
+            concurrency: self.concurrency
+        }
+    }
+
     fn print(&self) -> f64 {
         let percent = self.completed_bytes as f64 / self.total_bytes as f64 * 100.0;
         let mbps = as_megabits_per_sec(self.completed_bytes - self.last_print_bytes, self.last_print_time.elapsed());
-        println!("{0}: {1} {2:.1}% {3:.1}Mbps", self.label, Size::from_bytes(self.completed_bytes), percent, mbps);
+        println!("{0}: {1} {2:.1}% {3:.1}Mbps ({4} concurrent)", self.label, Size::from_bytes(self.completed_bytes), percent, mbps, self.concurrency);
         percent
+    }
+}
+
+impl Sub for &StatisticsSnapshot {
+    type Output = StatisticsDiff;
+
+    fn sub(self, other: Self) -> Self::Output {
+        StatisticsDiff {
+            label: self.label,
+            duration: self.end_time - other.end_time,
+            completed_bytes: self.completed_bytes - other.completed_bytes
+        }
+    }
+}
+
+struct RequestOptimizer {
+    history: HashMap<usize, f64>
+}
+
+impl RequestOptimizer {
+    fn new() -> RequestOptimizer {
+        RequestOptimizer {
+            history: HashMap::new()
+        }
+    }
+
+    fn add(&mut self, request_count: usize, megabits_per_sec: f64) {
+        self.history.insert(request_count, megabits_per_sec);
+    }
+
+    fn get_optimal_request_count(&self) -> usize {
+        let mut next_request_count = 1;
+        let mut next_mbps: f64 = 0.0;
+        for (request_count, megabits_per_sec) in &self.history {
+            if (*megabits_per_sec > next_mbps) {
+                next_request_count = request_count + 1;
+                next_mbps = *megabits_per_sec;
+            }
+        }
+        if next_request_count == 0 {
+            panic!("Internal error");
+        }
+        next_request_count
     }
 }
 
@@ -138,7 +215,6 @@ async fn fetch_read(net_stats: Arc<Mutex<Statistics>>, url: String, tx: Sender<W
 
     let mut stream = response.bytes_stream();
     let mut offset = start_offset;
-    let mut count_streams = 0;
 
     //println!("REQUEST BEGIN {start_offset}");
     while let Some(item) = stream.next().await {
@@ -151,7 +227,6 @@ async fn fetch_read(net_stats: Arc<Mutex<Statistics>>, url: String, tx: Sender<W
         net_stats.lock().unwrap().add(length);
 
         offset += length;
-        count_streams += 1;
     }
     //println!("REQUEST END {start_offset} count_streams={count_streams}");
 
@@ -164,6 +239,7 @@ async fn fetch(url: &str, filename: &str) -> Result<(), Box<dyn std::error::Erro
     let content_length = get_content_length(url).await?;
 
     let net_stats = Arc::new(Mutex::new(Statistics::new(StatisticsLabel::Network, content_length)));
+    let mut last_net_stats = net_stats.lock().unwrap().snapshot();
 
     let (tx, rx) = channel();
 
@@ -171,25 +247,38 @@ async fn fetch(url: &str, filename: &str) -> Result<(), Box<dyn std::error::Erro
     let fw = tokio::task::spawn_blocking(move || { fetch_writes(fw_filename, content_length, rx) });
 
     let max_request_length = 1024 * 1024;
-    let max_requests = 8;
+    let mut max_requests = 1;
 
     let mut offset: u64 = 0;
 
     let mut set = JoinSet::new();
 
-    loop {
-        if offset == content_length {
-            break
-        }
+    let mut optimizer = RequestOptimizer::new();
 
+    while offset < content_length {
         let end_offset = std::cmp::min(offset + max_request_length, content_length);
+
+        net_stats.lock().unwrap().set_concurrency(set.len() + 1);
 
         set.spawn(fetch_read(net_stats.clone(), String::from(url), tx.clone(), offset, end_offset));
 
         offset = end_offset;
 
-        if set.len() >= max_requests {
+        while set.len() >= max_requests {
             set.join_next().await.unwrap()??;
+
+            let snapshot_net_stats = net_stats.lock().unwrap().snapshot();
+            let diff: StatisticsDiff = &snapshot_net_stats - &last_net_stats;
+
+            let current_requests = set.len() + 1;
+
+            let mbps = as_megabits_per_sec(diff.completed_bytes, diff.duration);
+            //println!("Diff: {0} / {1:?} => {2} ({3} requests)", diff.completed_bytes, diff.duration, mbps, current_requests);
+
+            optimizer.add(current_requests, mbps);
+            max_requests = optimizer.get_optimal_request_count();
+
+            last_net_stats = snapshot_net_stats;
         }
     }
 
